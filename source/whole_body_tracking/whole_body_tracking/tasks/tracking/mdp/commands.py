@@ -801,7 +801,17 @@ class MotionCommand(CommandTerm):
         )
 
     def _update_command(self):
-        self.time_steps += 1
+        # ManagerBasedRLEnv clears episode_length_buf after an auto-reset and
+        # calls command_manager.compute() in the same step.  _resample_command
+        # has already written the reset frame in that case, so advancing here
+        # would expose frame k+1 while the robot state is still frame k.  The
+        # next step has episode_length_buf == 1 and resumes the normal advance.
+        episode_length = self._env.episode_length_buf
+        if episode_length.shape != self.time_steps.shape:
+            raise RuntimeError(
+                "episode_length_buf and time_steps must have identical shapes for reset synchronization"
+            )
+        self.time_steps += (episode_length != 0).to(dtype=self.time_steps.dtype)
         env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
         self._resample_command(env_ids)
 
@@ -2333,7 +2343,15 @@ class MultiMotionCommand(CommandTerm):
 
     def _update_command(self):
         self._global_sim_step += 1
-        self.time_steps += 1
+        # Keep the command frame written by _resample_command on the same-step
+        # auto-reset path.  Explicit/initial resets advance normally because
+        # episode_length_buf is 1 by the time the next step reaches compute().
+        episode_length = self._env.episode_length_buf
+        if episode_length.shape != self.time_steps.shape:
+            raise RuntimeError(
+                "episode_length_buf and time_steps must have identical shapes for reset synchronization"
+            )
+        self.time_steps += (episode_length != 0).to(dtype=self.time_steps.dtype)
 
         # Resample goal-block mask once per env step (no-op when p_mask <= 0).
         self._resample_goal_mask()
