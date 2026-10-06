@@ -54,6 +54,12 @@ from rsl_rl.utils import (
     try_build_rl_split_normalizers_from_checkpoint,
 )
 from rsl_rl.utils.finite_checks import replace_nonfinite_with_zeros
+from rsl_rl.utils.checkpoint_resume import (
+    checkpoint_progress,
+    ppo_optimizer_learning_rate,
+    resolve_checkpoint_phase,
+    resolve_checkpoint_progress,
+)
 
 # Distillation variants: all use teacher as privileged obs; latter three load teacher from checkpoint
 DISTILLATION_TYPES = (
@@ -713,6 +719,10 @@ class OnPolicyRunner:
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+        # Keep current_learning_iteration's legacy phase/last-completed meaning.
+        # A separate counter prevents re-executing the last completed update.
+        self._last_completed_learning_iteration = -1
+        self._next_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
     def _use_anybody_latent_split_normalizers(self) -> bool:
@@ -723,6 +733,11 @@ class OnPolicyRunner:
             and isinstance(self._anybody_latent_goal_dim, int)
             and isinstance(self._anybody_latent_proprio_dim, int)
         )
+
+    @property
+    def next_learning_iteration(self) -> int:
+        """The next training update; current_learning_iteration retains its phase."""
+        return self._next_learning_iteration
 
     def _normalize_student_obs(self, obs: torch.Tensor) -> torch.Tensor:
         if not self._use_anybody_latent_split_normalizers():
@@ -855,7 +870,20 @@ class OnPolicyRunner:
         eval_fixed_mask_mode_idx: int | None = None,
         eval_log_key_prefix: str | None = None,
         eval_log_step_offset: int | None = None,
-    ):  # noqa: C901
+    ) -> None:  # noqa: C901
+        if (
+            isinstance(num_learning_iterations, bool)
+            or not isinstance(num_learning_iterations, int)
+            or num_learning_iterations < 0
+        ):
+            raise ValueError("num_learning_iterations must be a nonnegative integer")
+        if num_learning_iterations == 0:
+            return
+        # MotionOnPolicyRunner may explicitly advance current for a training
+        # chunk. Evaluation retains the checkpoint phase without advancing it.
+        start_iter = self.current_learning_iteration if eval_mode else max(
+            self.current_learning_iteration, self._next_learning_iteration
+        )
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
@@ -923,7 +951,7 @@ class OnPolicyRunner:
         spe = int(self.num_steps_per_env)
         setattr(env_u_curr, "curriculum_env_steps_per_learning_iteration", spe)
         setattr(env_u_curr, "curriculum_counter_anchor", int(getattr(env_u_curr, "common_step_counter", 0)))
-        setattr(env_u_curr, "curriculum_learning_iteration_anchor", int(self.current_learning_iteration))
+        setattr(env_u_curr, "curriculum_learning_iteration_anchor", int(start_iter))
 
         # start learning
         obs, extras = self.env.get_observations()
@@ -1001,7 +1029,6 @@ class OnPolicyRunner:
                 )
 
         # Start training
-        start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
@@ -1182,6 +1209,8 @@ class OnPolicyRunner:
                 stop = time.time()
                 learn_time = stop - start
                 self.current_learning_iteration = it
+                self._last_completed_learning_iteration = it
+                self._next_learning_iteration = it + 1
             # log info
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
@@ -1393,7 +1422,7 @@ class OnPolicyRunner:
         )
         print(log_string)
 
-    def save(self, path: str, infos=None):
+    def save(self, path: str, infos: dict | None = None) -> None:
         # Check if using ResidualActorCritic (special handling)
         from rsl_rl.modules import ResidualActorCritic
         if isinstance(self.alg.policy, ResidualActorCritic):
@@ -1415,9 +1444,12 @@ class OnPolicyRunner:
         saved_dict = {
             "model_state_dict": model_state_dict,
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
-            "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        saved_dict.update(checkpoint_progress(
+            self._last_completed_learning_iteration, self._next_learning_iteration,
+            phase=self.current_learning_iteration,
+        ))
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -1444,8 +1476,17 @@ class OnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path: str, load_optimizer: bool = True, load_critic: bool = True):
-        loaded_dict = torch.load(path, weights_only=False)
+    def load(
+        self, path: str, load_optimizer: bool = True, load_critic: bool = True,
+        load_iteration: bool = True,
+    ) -> dict | None:
+        """Restore a checkpoint; weight warmstarts can explicitly retain fresh progress.
+
+        Full PPO resume restores Adam and its scalar LR, then starts at the next
+        update. Weight-only evaluation keeps the legacy checkpoint phase and
+        configured optimizer/LR. This does not restore simulator or RNG state.
+        """
+        loaded_dict = torch.load(path, map_location=self.device, weights_only=False)
 
         # Check if using ResidualActorCritic (special handling)
         from rsl_rl.modules import ResidualActorCritic
@@ -1498,15 +1539,26 @@ class OnPolicyRunner:
                 alg=self.alg,
             )
         # -- load optimizer if used
+        optimizer_loaded = False
         if load_optimizer and resumed_training:
             if not load_critic:
                 print("[Runner] Skipping optimizer load because load_critic=False.")
             else:
+                # Validate outside the legacy stage-transfer fallback: silently
+                # accepting an invalid LR would corrupt a requested PPO resume.
+                if self.training_type == "rl":
+                    restored_lr = ppo_optimizer_learning_rate(loaded_dict["optimizer_state_dict"])
                 try:
                     # -- algorithm optimizer
                     self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+                    optimizer_loaded = True
                     print("[Runner] Loaded optimizer state from checkpoint.")
                 except (ValueError, KeyError) as e:
+                    if self.training_type == "rl":
+                        raise RuntimeError(
+                            "Cannot fully resume PPO optimizer; use an explicit weight-only warmstart "
+                            "for a different training stage."
+                        ) from e
                     # Optimizer state mismatch (e.g., different parameter groups between stages)
                     # This can happen when:
                     # - Stage 1 had frozen critic (optimizer only has actor params)
@@ -1514,6 +1566,11 @@ class OnPolicyRunner:
                     print(f"[Runner] WARNING: Could not load optimizer state: {e}")
                     print("[Runner] Optimizer will be initialized from scratch (learning rate, momentum, etc. reset)")
                     print("[Runner] This is expected when transitioning between training stages with different frozen parameters.")
+
+                if optimizer_loaded and self.training_type == "rl":
+                    # Restore only the scalar consumed by PPO's existing
+                    # adaptive rule; do not modify loaded optimizer groups.
+                    self.alg.learning_rate = restored_lr
 
                 # -- RND optimizer if used
                 if self.alg.rnd:
@@ -1526,8 +1583,14 @@ class OnPolicyRunner:
                     except (ValueError, KeyError) as e:
                         print(f"[Runner] WARNING: Could not load discriminator optimizer state: {e}")
         # -- load current learning iteration
-        if resumed_training:
-            self.current_learning_iteration = loaded_dict["iter"]
+        if resumed_training and load_iteration:
+            last_completed, next_iteration = resolve_checkpoint_progress(loaded_dict)
+            self.current_learning_iteration = resolve_checkpoint_phase(loaded_dict)
+            # Progress loading is independent of optimizer loading. Evaluation
+            # uses current phase; training never repeats a completed update.
+            # An actual fresh warmstart uses load_iteration=False explicitly.
+            self._last_completed_learning_iteration = last_completed
+            self._next_learning_iteration = next_iteration
 
         # -- Reset noise std if specified in config (for stage transitions)
         # This allows changing exploration noise when resuming from a checkpoint
@@ -1669,3 +1732,9 @@ class OnPolicyRunner:
         )
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
+
+
+if __name__ == "__main__":
+    from rsl_rl.utils.checkpoint_resume import sanity_check
+
+    sanity_check()

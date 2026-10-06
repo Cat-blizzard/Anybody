@@ -478,7 +478,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Initializing policy from pretrained checkpoint (no optimizer resume): {pretrained_path}")
         # Only warmstart the actor from the distillation checkpoint; keep the critic
         # randomly initialized so it can adapt cleanly to PPO.
-        runner.load(pretrained_path, load_optimizer=False, load_critic=False)
+        runner.load(pretrained_path, load_optimizer=False, load_critic=False, load_iteration=False)
 
     if getattr(args_cli, "warmstart_from_masked_partial_kp_tracker", False) and not getattr(
         args_cli, "test_prior_quality", False
@@ -505,8 +505,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if getattr(args_cli, "test_prior_quality", False):
             runner.load(resume_path, load_optimizer=False, load_critic=False)
         else:
-            # load policy only; do not load optimizer so current config LR is used
-            runner.load(resume_path, load_optimizer=True)  # TODO: check if this is correct
+            # Full resume restores optimizer moments, its LR, and the next update.
+            runner.load(resume_path, load_optimizer=True)
 
     if int(os.environ.get("RANK", "0")) == 0:
         # dump the configuration into log-directory
