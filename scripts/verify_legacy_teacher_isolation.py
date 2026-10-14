@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from typing import Any, BinaryIO, Sequence
@@ -207,6 +208,31 @@ def legacy_loader_contract() -> Json:
             'point_semantics_not_repaired_by_this_check': True}
 
 
+def compare_legacy_loader_contract(expected: Json, actual: Json) -> Json | None:
+    """Require exact source bytes/semantics; AST tooling digest is descriptive.
+
+    Python AST schemas differ (e.g. ClassDef.type_params exists in 3.14 but
+    not 3.11). Identical source bytes can therefore have different ast.dump
+    hashes. Only that one digest may differ: paths, required keys, axes,
+    units, source SHA and every other contract field must remain identical.
+    """
+    assert set(expected) == set(actual), 'Legacy loader contract fields changed'
+    digest_key = 'class_AST_sha256'
+    for value in (expected[digest_key], actual[digest_key]):
+        assert isinstance(value, str) and len(value) == 64
+        assert all(character in '0123456789abcdef' for character in value)
+    changed = [key for key in expected if key != digest_key and expected[key] != actual[key]]
+    assert not changed, f'Legacy loader changed: {changed}'
+    if expected[digest_key] == actual[digest_key]:
+        return None
+    return {'expected_digest': expected[digest_key], 'actual_digest': actual[digest_key],
+            'source_sha256': actual['source_sha256'], 'source_SHA_unchanged': True,
+            'all_other_loader_contract_fields_equal': True,
+            'actual_Python_version': sys.version,
+            'actual_AST_ClassDef_fields': list(ast.ClassDef._fields),
+            'interpretation': 'Descriptive AST tooling difference only; exact source bytes are unchanged.'}
+
+
 def catalog_identity(root: Path) -> Json:
     entries: Json = {}
     for path in sorted(root.rglob('*.npz')):
@@ -344,6 +370,7 @@ def verify(snapshot: Path, pythonpath: str | None) -> Json:
     expected = read_json(snapshot)
     validate_snapshot_contract(expected)
     checked = 0
+    ast_difference: Json | None = None
     for repo in expected['repositories']:
         actual = repository_identity(Path(repo['root']))
         assert not repository_drift(repo, actual), f'Legacy repository changed: {repo["root"]}'
@@ -352,7 +379,7 @@ def verify(snapshot: Path, pythonpath: str | None) -> Json:
         assert file_identity(Path(name)) == identity, f'Preserved file changed: {name}'
         checked += 1
     if expected['schema_version'] == 2:
-        assert legacy_loader_contract() == expected['legacy_loader'], 'Legacy loader changed'
+        ast_difference = compare_legacy_loader_contract(expected['legacy_loader'], legacy_loader_contract())
         catalog = expected['legacy_C_catalog']
         assert catalog_identity(Path(catalog['root'])) == catalog, 'Legacy C catalog changed'
         for name, header in expected['NPZ_header_samples'].items():
@@ -364,12 +391,31 @@ def verify(snapshot: Path, pythonpath: str | None) -> Json:
             'content_hashed_files_checked': checked,
             'legacy_C_catalog_checked': expected['schema_version'] == 2,
             'legacy_explicit_import_resolution': imports,
+            'AST_tooling_digest_difference': ast_difference,
             'full_NPZ_payload_rehash': False, 'new_native_resume_validation': 'NOT_RUN'}
 
 
 def self_test() -> Json:
     """Synthetic byte mutation, schema, boundary, no-overwrite and path tests."""
     AUDIT.mkdir(parents=True, exist_ok=True)
+    loader = legacy_loader_contract()
+    assert compare_legacy_loader_contract(loader, dict(loader)) is None
+    tooling_changed = dict(loader)
+    tooling_changed['class_AST_sha256'] = '0' * 64 if loader['class_AST_sha256'] != '0' * 64 else '1' * 64
+    difference = compare_legacy_loader_contract(loader, tooling_changed)
+    assert difference is not None and difference['source_SHA_unchanged']
+    contract_mutations = {
+        'source_sha256': '0' * 64,
+        'required_NPZ_keys': loader['required_NPZ_keys'][1:],
+        'positions': 'world link origins, centimeters',
+        'linear_velocities': 'link-origin velocity',
+        'quaternion_order': 'XYZW', 'joint_count': 28, 'full_body_count': 31,
+    }
+    for key, value in contract_mutations.items():
+        changed = dict(tooling_changed); changed[key] = value
+        try: compare_legacy_loader_contract(loader, changed)
+        except AssertionError: pass
+        else: raise AssertionError(f'Loader semantic/source mutation accepted: {key}')
     with tempfile.TemporaryDirectory(prefix='isolation_selftest_', dir=AUDIT) as folder:
         root = Path(folder); path = root/'example.py'; path.write_text('x = 1\n')
         before = file_identity(path); assert file_identity(path) == before
@@ -421,6 +467,8 @@ def self_test() -> Json:
             'synthetic_shape':[1,29],'mutation_and_HEAD_detection':True,
             'object_array_rejected':True,'overwrite_and_path_escape_rejected':True,
             'empty_baseline_rejected':True,
+            'same_source_AST_tooling_difference_allowed':True,
+            'loader_source_keys_units_axes_mutations_rejected':len(contract_mutations),
             'legacy_import_identity_checked_without_import':True}
 
 
