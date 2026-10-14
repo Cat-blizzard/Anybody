@@ -34,12 +34,17 @@ MAX_PARALLEL="${MAX_PARALLEL:-8}"
 SEQUENTIAL="${SEQUENTIAL:-0}"
 
 SCRIPT="${MOSAIC_ROOT}/scripts/batch_csv_to_npz.py"
+G1_ENTRYPOINT="${MOSAIC_ROOT}/scripts/run_g1_reference_script.py"
 if [[ ! -f "${SCRIPT}" ]]; then
   echo "ERROR: batch script not found: ${SCRIPT}" >&2
   exit 1
 fi
 if [[ ! -f "${MOSAIC_ROOT}/scripts/root_velocity_contract.py" ]]; then
   echo "ERROR: versioned converter helper missing; refusing a historical converter: ${MOSAIC_ROOT}" >&2
+  exit 1
+fi
+if [[ ! -f "${G1_ENTRYPOINT}" ]]; then
+  echo "ERROR: pinned G1 compatibility entrypoint missing: ${G1_ENTRYPOINT}" >&2
   exit 1
 fi
 if [[ "${ROOT_VELOCITY_MODE}" != "link_v2" && "${ROOT_VELOCITY_MODE}" != "legacy_com_v1" ]]; then
@@ -75,7 +80,7 @@ run_shard() {
   fi
   # Each worker owns a distinct, nonexistent directory. Never share batch output roots.
   local shard_output="${OUT_DIR}/shard_${i}"
-  local command=("${PYTHON_BIN}" "${SCRIPT}"
+  local command=("${PYTHON_BIN}" "${G1_ENTRYPOINT}" "${SCRIPT}"
     --input_dir "${indir}" --output_dir "${shard_output}"
     --output_prefix "${OUTPUT_PREFIX}" --input_fps "${INPUT_FPS}"
     --output_fps "${OUTPUT_FPS}" --root_velocity_mode "${ROOT_VELOCITY_MODE}"

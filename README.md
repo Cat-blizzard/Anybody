@@ -254,3 +254,34 @@ Use the isolation verifier before any old-C continuation. Native simulator reset
 conversion and learning-effect validation are **NOT_RUN** in this repair delivery;
 the CPU checks do not establish improved tracking or physics performance. Student
 normalization/freezing and paper-preset differences are outside this teacher patch.
+
+## G1 compatibility entry and bounded native reset check
+
+Use this worktree's entry for G1 scripts on the installed Isaac Lab stack:
+
+```bash
+python scripts/run_g1_reference_script.py scripts/rsl_rl/train.py [G1 training arguments]
+python scripts/run_g1_reference_script.py scripts/csv_to_npz.py [conversion arguments]
+python scripts/run_g1_reference_script.py --self-test
+python tests/test_g1_entrypoint.py
+python scripts/check_teacher_reset_native.py --self-test
+```
+
+The entry pins both project packages, rejects conflicting loaded sources and
+adapts the metadata pickle helper and RSL observation return containers. It
+preserves the underlying tensors, actions, rewards and termination values.
+The robot registry advertises only available configurations; missing optional
+robots do not receive replacement G1 configurations. The shard launcher uses
+this entry. Old C continues to use its original source and launch pipeline.
+
+The bounded native checker takes `--task`, `--motion`, `--num_envs`,
+`--output_dir`, `--device` and `--headless`. Its read-only DEV view is identified
+by `DEV3_INPUTS.json` in the view's parent directory. Each profile uses seven
+control steps and records reset caches, independent NPZ/PhysX pose targets,
+first-step reward and termination, untouched rows and frame transitions.
+Reset perturbations, pushes and observation noise are disabled for this
+diagnostic; startup randomization remains, and a 0.08-second episode exercises
+the normal timeout reset path. Actions are reference joint PD targets.
+The checker does not measure trained-policy performance or the motion-end
+boundary and does not execute CSV conversion. Native receipts, including
+failures, are preserved separately from the CPU repair delivery.

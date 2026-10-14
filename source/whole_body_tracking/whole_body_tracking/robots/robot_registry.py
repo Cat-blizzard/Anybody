@@ -12,8 +12,22 @@ from dataclasses import dataclass
 from isaaclab.assets import ArticulationCfg
 
 from .g1 import G1_CYLINDER_CFG
-from .h1_2 import H1_2_CYLINDER_CFG
-from .adam import ADAM_CYLINDER_CFG
+
+# Missing optional robots must not make the complete G1 platform unavailable.
+# Only suppress absence of the requested module itself. A dependency failure
+# inside an existing robot module is a real error and must propagate.
+try:
+    from .h1_2 import H1_2_CYLINDER_CFG
+except ModuleNotFoundError as error:
+    if error.name != f"{__package__}.h1_2":
+        raise
+    H1_2_CYLINDER_CFG = None
+try:
+    from .adam import ADAM_CYLINDER_CFG
+except ModuleNotFoundError as error:
+    if error.name != f"{__package__}.adam":
+        raise
+    ADAM_CYLINDER_CFG = None
 
 
 @dataclass(frozen=True)
@@ -23,6 +37,10 @@ class RobotPlatformSpec:
     name: str
     cfg: ArticulationCfg
     joint_names: list[str]
+
+    def __post_init__(self) -> None:
+        assert self.cfg is not None, "An unavailable robot cannot be registered"
+        assert self.joint_names and len(self.joint_names) == len(set(self.joint_names))
 
 
 ROBOT_PLATFORMS: dict[str, RobotPlatformSpec] = {
@@ -61,7 +79,7 @@ ROBOT_PLATFORMS: dict[str, RobotPlatformSpec] = {
             "right_wrist_yaw_joint",
         ],
     ),
-    "h1_2": RobotPlatformSpec(
+    **({"h1_2": RobotPlatformSpec(
         name="h1_2",
         cfg=H1_2_CYLINDER_CFG,
         joint_names=[
@@ -93,8 +111,8 @@ ROBOT_PLATFORMS: dict[str, RobotPlatformSpec] = {
             "right_wrist_pitch_joint",
             "right_wrist_yaw_joint",
         ],
-    ),
-    "adam": RobotPlatformSpec(
+    )} if H1_2_CYLINDER_CFG is not None else {}),
+    **({"adam": RobotPlatformSpec(
         name="adam",
         cfg=ADAM_CYLINDER_CFG,
         joint_names=[
@@ -122,7 +140,7 @@ ROBOT_PLATFORMS: dict[str, RobotPlatformSpec] = {
             "shoulderYaw_Right",
             "elbow_Right",
         ],
-    ),
+    )} if ADAM_CYLINDER_CFG is not None else {}),
 }
 
 
@@ -136,5 +154,12 @@ def get_robot_platform(name: str) -> RobotPlatformSpec:
     if name not in ROBOT_PLATFORMS:
         raise KeyError(f"Unknown robot platform '{name}'. Available: {available_robot_names()}")
     return ROBOT_PLATFORMS[name]
+
+
+if __name__ == "__main__":
+    platform = get_robot_platform("g1")
+    assert platform.cfg is G1_CYLINDER_CFG and len(platform.joint_names) == 29
+    assert all(spec.cfg is not None for spec in ROBOT_PLATFORMS.values())
+    print(f"Registry sanity: available={available_robot_names()}, G1 joint_count=29, PASS")
 
 
