@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.abc
 import importlib.machinery
+import builtins
 import pickle
 import runpy
 import sys
@@ -53,6 +54,11 @@ def assert_loaded_package_sources() -> None:
             if name != prefix and not name.startswith(prefix+"."):
                 continue
             filename = getattr(module,"__file__",None)
+            # A successfully imported package may have another module still
+            # initializing. Its spec origin is an equally explicit provenance.
+            if filename is None:
+                origin=getattr(getattr(module,"__spec__",None),"origin",None)
+                if isinstance(origin,str): filename=origin
             if filename is not None:
                 if not Path(filename).resolve().is_relative_to(directory.resolve()):
                     raise RuntimeError(f"Already loaded {name} from conflicting source: {filename}")
@@ -173,13 +179,35 @@ class CompatibilityFinder(importlib.abc.MetaPathFinder):
         return spec
 
 
-def install_api_compatibility() -> None:
+def adapt_loaded_api_modules() -> None:
+    """Idempotent check of only the two API modules; no package import/RNG."""
     for name,adapter in (("isaaclab.utils.io",add_dump_pickle),
                          ("isaaclab_rl.rsl_rl.vecenv_wrapper",adapt_vecenv_observation_abi)):
         module=sys.modules.get(name)
         if module is not None: adapter(module)
+
+
+def install_api_compatibility() -> None:
+    adapt_loaded_api_modules()
     if not any(isinstance(finder,CompatibilityFinder) for finder in sys.meta_path):
         sys.meta_path.insert(0,CompatibilityFinder())
+    if getattr(builtins.__import__,"_g1_post_import_compatibility",False):
+        return
+    original_import=builtins.__import__
+
+    def compatible_import(name: str,globals: dict[str,Any] | None=None,
+                          locals: dict[str,Any] | None=None,
+                          fromlist: Sequence[str]=(),level: int=0) -> Any:
+        result=original_import(name,globals,locals,fromlist,level)
+        # Kit fast importers can precede our MetaPath finder, and cached modules
+        # never enter a finder. Inspect the completed/cached actual modules too.
+        adapt_loaded_api_modules()
+        if any(name==prefix or name.startswith(prefix+".") for prefix in PACKAGE_ROOTS):
+            assert_loaded_package_sources()
+        return result
+
+    compatible_import._g1_post_import_compatibility=True
+    builtins.__import__=compatible_import
 
 
 def sanity_check() -> None:

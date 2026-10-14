@@ -8,6 +8,7 @@ checks distinguish container adaptation from a change in observations/control.
 from __future__ import annotations
 
 import contextlib
+import builtins
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -153,6 +154,77 @@ class StartupTests(unittest.TestCase):
         module=ModuleType('isaaclab_rl.rsl_rl.vecenv_wrapper');module.RslRlVecEnvWrapper=Wrapper
         entry.adapt_vecenv_observation_abi(module)
         assert Wrapper().get_observations() is legacy_get and Wrapper().step(actions) is legacy_step
+
+    def test_post_import_fast_finder_and_wrong_source(self) -> None:
+        self._post_import_witness('fast_finder')
+
+    def test_post_import_cached_modules_and_wrong_source(self) -> None:
+        self._post_import_witness('cached')
+
+    def _post_import_witness(self, mode: str) -> None:
+        """A real import bypasses CompatibilityFinder, not a direct adapter call."""
+        assert mode in ('fast_finder','cached')
+        names=('isaaclab','isaaclab.utils','isaaclab.utils.io','isaaclab_rl',
+               'isaaclab_rl.rsl_rl','isaaclab_rl.rsl_rl.vecenv_wrapper','whole_body_tracking')
+        saved={name:sys.modules[name] for name in names if name in sys.modules}
+        original_import=builtins.__import__;original_meta=list(sys.meta_path)
+        try:
+            for mode in (mode,):
+                for name in names:sys.modules.pop(name,None)
+                for name in ('isaaclab','isaaclab.utils','isaaclab_rl','isaaclab_rl.rsl_rl'):
+                    module=ModuleType(name);module.__path__=[];sys.modules[name]=module
+                policy=torch.zeros(1,815);critic=torch.ones(1,289)
+                observations=TensorDict({'policy':policy,'critic':critic},batch_size=[1])
+                actions=torch.zeros(1,29);rewards=torch.ones(1);dones=torch.zeros(1,dtype=torch.long)
+                marker=torch.tensor([7.]);extras={'marker':marker}
+                class Wrapper:
+                    def get_observations(self) -> TensorDict:return observations
+                    def step(self,received: torch.Tensor) -> tuple[Any,...]:
+                        assert received is actions
+                        return observations,rewards,dones,extras
+                load_count: list[str]=[]
+                class FastLoader(importlib.abc.Loader):
+                    def create_module(self,spec: Any) -> None:return None
+                    def exec_module(self,module: ModuleType) -> None:
+                        load_count.append(module.__name__)
+                        if module.__name__.endswith('vecenv_wrapper'):
+                            module.RslRlVecEnvWrapper=Wrapper
+                            assert not getattr(Wrapper,'_g1_legacy_obs_contract_installed',False)
+                class FastFinder(importlib.abc.MetaPathFinder):
+                    def find_spec(self,fullname: str,path: Any,target: Any=None) -> Any:
+                        if fullname in ('isaaclab.utils.io','isaaclab_rl.rsl_rl.vecenv_wrapper'):
+                            return importlib.machinery.ModuleSpec(fullname,FastLoader())
+                        return None
+                entry.install_api_compatibility()
+                hook=builtins.__import__;entry.install_api_compatibility();assert builtins.__import__ is hook
+                finder=FastFinder();sys.meta_path.insert(0,finder)
+                if mode=='cached':
+                    io_module=ModuleType('isaaclab.utils.io');sys.modules[io_module.__name__]=io_module
+                    vector=ModuleType('isaaclab_rl.rsl_rl.vecenv_wrapper');vector.RslRlVecEnvWrapper=Wrapper
+                    sys.modules[vector.__name__]=vector
+                rng=torch.random.get_rng_state().clone()
+                vector=builtins.__import__('isaaclab_rl.rsl_rl.vecenv_wrapper',fromlist=['RslRlVecEnvWrapper'])
+                io_module=builtins.__import__('isaaclab.utils.io',fromlist=['dump_pickle'])
+                assert vector.RslRlVecEnvWrapper is Wrapper and callable(io_module.dump_pickle)
+                assert getattr(Wrapper,'_g1_legacy_obs_contract_installed',False)
+                result,info=Wrapper().get_observations();assert result is policy
+                assert info['observations']['policy'] is policy and info['observations']['critic'] is critic
+                p,r,d,e=Wrapper().step(actions)
+                assert p is policy and r is rewards and d is dones and e['marker'] is marker
+                assert e['observations']['critic'] is critic and 'observations' not in extras
+                assert torch.equal(rng,torch.random.get_rng_state())
+                assert len(load_count)==(2 if mode=='fast_finder' else 0)
+                wrong=ModuleType('whole_body_tracking')
+                wrong.__file__='/data/jxc/projects/bones_curated/references/AnyBody/source/whole_body_tracking/whole_body_tracking/__init__.py'
+                sys.modules['whole_body_tracking']=wrong
+                with self.assertRaises(RuntimeError):builtins.__import__('whole_body_tracking')
+                sys.modules.pop('whole_body_tracking')
+                sys.meta_path.remove(finder)
+                print(f'Post-import {mode}: MetaPath bypass/cache real import, ABI tensor identity/RNG and wrong-source rejection PASS')
+        finally:
+            builtins.__import__=original_import;sys.meta_path[:]=original_meta
+            for name in names:sys.modules.pop(name,None)
+            sys.modules.update(saved)
 
     def test_actual_converter_help_prefixes_and_shard_plan_no_native(self) -> None:
         with tempfile.TemporaryDirectory(prefix='CLI_fixture_',dir=AUDIT) as folder:
