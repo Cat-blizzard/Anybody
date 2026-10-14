@@ -192,3 +192,65 @@ This project builds on the following open-source works:
 - **[Isaac Lab](https://github.com/isaac-sim/IsaacLab)** — simulation framework
 - **[Isaac Sim](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)** — physics engine
 - **[rsl_rl](https://github.com/leggedrobotics/rsl_rl)** — RL training library (modified and extended)
+
+## Isolated teacher correctness repairs (2026-10-15)
+
+This worktree branches from `c319a6609158fdb7456c065800b9a489b2605f5b`.
+The legacy worktrees, existing ABC motion files and checkpoints remain intact.
+Old C must continue with `/data/jxc/projects/bones_curated/references/AnyBody_resume_state_fix_20261006`
+and its frozen C data. Do not replace shared editable installations or modify
+the old worktree to enable these repairs. Select both source packages explicitly
+using `PYTHONPATH` in each future run and record their resolved source paths.
+
+All three profiles below include the reset-cache repair and removal of the unused
+actor debug path that rejected an all-zero goal. The PPO/network architecture,
+815-dimensional teacher observations and existing 30-body NPZ axes are retained.
+Original reward functions and task IDs remain available for controlled comparisons.
+
+| Task ID | Reward changes |
+|---|---|
+| `General-Tracking-Flat-G1-Teacher-Cache-v1` | Original reward recipe, refreshed reset caches |
+| `General-Tracking-Flat-G1-Teacher-Wrists-v1` | Upper6/lower8 world-position extension; original VR term retained |
+| `General-Tracking-Flat-G1-Teacher-Points-v1` | Wrist profile plus asset-defined virtual head + two wrist origins |
+
+The extension keeps pelvis, hips, knees, ankles and torso in the original lower
+group. Adding wrists changes the upper mean denominator from four to six;
+unchanged nominal weights do not mean an unchanged objective.
+
+The Points profile records `g1_urdf_nominal_isolated_head_com_v1` and derives the
+torso-frame offset `(0.0092305, 0.000299, 0.405869)` metres from the fixed head joint
+and isolated-head inertial origin. Reference and actual torso poses use the same
+WXYZ rotation and offset. This declared surrogate is neither the merged torso CoM
+nor a certified author/headset landmark. It does not substitute torso for head,
+add a simulated body, or change the observation interface. Missing required point
+names and invalid shapes/values raise errors instead of silently yielding zero.
+
+The single/batch CSV converters default to `--root_velocity_mode link_v2`, using
+the native link-state writer to transform
+`v_COM = v_link + omega_world x (R_link * r_COM)`.
+Their existing `body_lin_vel_w` output key explicitly stores body CoM velocity.
+Every conversion requires a **new** output directory and uses exclusive NPZ
+creation; existing files/directories and escaping destinations are rejected.
+`legacy_com_v1` is an explicit comparison mode and also requires new output.
+NPZ metadata records the mode, point axes, CSV/asset/converter/API hashes and units.
+No existing NPZ has been regenerated. Keep velocity-corrected data as a separate
+factor from reward repairs; a future run must verify its actual NPZ metadata.
+
+CPU checks (use the project's Python environment; no simulator is launched):
+
+```bash
+python tests/test_command_reset_cache.py
+python tests/test_teacher_point_rewards.py
+python tests/test_actor_zero_goal.py
+python scripts/csv_to_npz.py --self-test
+python scripts/batch_csv_to_npz.py --self-test
+python scripts/test_root_velocity_contract.py
+python scripts/verify_legacy_teacher_isolation.py
+```
+
+The legacy isolation snapshot and delivery evidence are in
+`/data/jxc/projects/bones_curated/training/audit/anybody_teacher_correctness_fix_20261015`.
+Use the isolation verifier before any old-C continuation. Native simulator reset,
+conversion and learning-effect validation are **NOT_RUN** in this repair delivery;
+the CPU checks do not establish improved tracking or physics performance. Student
+normalization/freezing and paper-preset differences are outside this teacher patch.

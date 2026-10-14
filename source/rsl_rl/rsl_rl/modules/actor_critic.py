@@ -262,16 +262,8 @@ class ActorCritic(nn.Module):
 
         # compute mean (actor.forward handles both standard and skip connection modes)
         mean = self.actor(observations)
-        
-        # temp:
-        goal = observations[:, :465]
-        proprio = observations[:, 465:]
-        with torch.no_grad():
-            g = goal.detach()
-            nz = g.abs().flatten(0, -2).amax(dim=0) > 1e-6
-            goal_compact = g[..., nz]
-            row0 = goal_compact.reshape(-1, goal_compact.shape[-1])[0]
-            
+        # No unused goal-compaction debug path: an entirely zero finite goal
+        # is a valid input and must not fail via reshape(-1, 0).
         mean = self._ensure_finite(mean, "action mean")
         # compute standard deviation
         if self.noise_std_type == "scalar":

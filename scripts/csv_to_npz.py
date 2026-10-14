@@ -1,4 +1,8 @@
-"""This script replay a motion from a csv file and output it to a npz file
+"""Replay CSV into a fresh NPZ directory using the versioned link/COM contract.
+
+Run ``python csv_to_npz.py --self-test`` for a CPU-only test without Isaac.
+The default link_v2 uses link-origin velocity input and native COM velocity
+output. Each invocation requires a previously nonexistent output directory.
 
 .. code-block:: bash
 
@@ -49,9 +53,24 @@ def _sanitize_python_path_for_isaac() -> None:
 
 _sanitize_python_path_for_isaac()
 
+# This path must finish before importing AppLauncher or launching Isaac/Kit.
+if '--self-test' in sys.argv:
+    if sys.argv[1:] != ['--self-test']:
+        raise SystemExit('--self-test is CPU-only and must be used alone')
+    from root_velocity_contract import self_test
+
+    self_test()
+    raise SystemExit(0)
+
 import argparse
+from pathlib import Path
+from typing import Any
 import numpy as np
 
+from root_velocity_contract import (
+    MODES, conversion_metadata, npz_output_path, reserve_output_directory,
+    save_npz_exclusive, validate_mode, write_csv_root_state,
+)
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -68,8 +87,10 @@ parser.add_argument(
         " loaded."
     ),
 )
-parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
+parser.add_argument("--output_name", type=str, required=True, help="NPZ path whose parent must be a new directory; existing directories are refused.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
+parser.add_argument('--root_velocity_mode', choices=MODES, default='link_v2',
+                    help='link_v2 correctly transforms link velocity to native COM velocity; legacy_com_v1 explicitly reproduces the old mismatch. Both require a new output directory.')
 parser.add_argument(
     "--robot",
     type=str,
@@ -131,6 +152,17 @@ if args_cli.bones_seed_g1_csv:
 # Default headless on for server runs; use --no_headless for a local window
 args_cli.headless = not args_cli.no_headless
 
+# Refuse historical/output collisions before starting the native application.
+if args_cli.input_fps <= 0 or args_cli.output_fps <= 0 or not np.isfinite(args_cli.position_scale) or args_cli.position_scale <= 0:
+    parser.error('FPS and position_scale must be positive and finite')
+if args_cli.frame_range is not None and not (1 <= args_cli.frame_range[0] <= args_cli.frame_range[1]):
+    parser.error('frame_range requires 1 <= START <= END')
+source_csv = Path(args_cli.input_file).expanduser().resolve(strict=True)
+if not source_csv.is_file():
+    parser.error('input_file must be a regular CSV file')
+output_path = npz_output_path(args_cli.output_name)
+output_run = reserve_output_directory(output_path.parent, validate_mode(args_cli.root_velocity_mode))
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -153,7 +185,7 @@ from motion_csv_loader import MotionLoader
 from whole_body_tracking.robots.robot_registry import available_robot_names, get_robot_platform
 
 
-def create_replay_scene_cfg(robot_cfg: ArticulationCfg):
+def create_replay_scene_cfg(robot_cfg: ArticulationCfg) -> type[InteractiveSceneCfg]:
     """Create a scene configuration for replaying motions with the specified robot."""
 
     @configclass
@@ -178,9 +210,14 @@ def create_replay_scene_cfg(robot_cfg: ArticulationCfg):
     return ReplayMotionsSceneCfg
 
 
-def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]):
+def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]) -> None:
     """Runs the simulation loop."""
-    # Load motion
+    robot = scene['robot']
+    options = {name:getattr(args_cli,name) for name in ('robot','input_fps','output_fps','frame_range',
+               'csv_skip_header','csv_drop_frame_column','root_rotation','joint_angles_in_degrees','position_scale')}
+    options['source_joint_names'] = joint_names
+    metadata = conversion_metadata(source_csv, options, output_run, robot, Path(__file__))
+    # Load motion without changing its link-origin position/velocity convention.
     motion = MotionLoader(
         motion_file=args_cli.input_file,
         input_fps=args_cli.input_fps,
@@ -196,11 +233,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
     )
 
     # Extract scene entities
-    robot = scene["robot"]
     robot_joint_indexes = robot.find_joints(joint_names, preserve_order=True)[0]
+    assert len(robot_joint_indexes) == len(joint_names)
 
     # ------- data logger -------------------------------------------------------
-    log = {
+    log: dict[str, Any] = {
         "fps": [args_cli.output_fps],
         "joint_pos": [],
         "joint_vel": [],
@@ -233,13 +270,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
         root_states[:, 3:7] = motion_base_rot
         root_states[:, 7:10] = motion_base_lin_vel
         root_states[:, 10:] = motion_base_ang_vel
-        robot.write_root_state_to_sim(root_states)
+        write_csv_root_state(robot, root_states, validate_mode(args_cli.root_velocity_mode))
 
         # set joint state
         joint_pos = robot.data.default_joint_pos.clone()
         joint_vel = robot.data.default_joint_vel.clone()
         joint_pos[:, robot_joint_indexes] = motion_dof_pos
         joint_vel[:, robot_joint_indexes] = motion_dof_vel
+        assert joint_pos.shape == joint_vel.shape == robot.data.default_joint_pos.shape
+        assert bool(torch.isfinite(joint_pos).all()) and bool(torch.isfinite(joint_vel).all())
         robot.write_joint_state_to_sim(joint_pos, joint_vel)
         sim.render()  # We don't want physic (sim.step())
         scene.update(sim.get_physics_dt())
@@ -252,7 +291,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
             log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
             log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
             log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
-            log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
+            log["body_lin_vel_w"].append(robot.data.body_com_lin_vel_w[0, :].cpu().numpy().copy())
             log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
 
         if reset_flag and not file_saved:
@@ -267,16 +306,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
             ):
                 log[k] = np.stack(log[k], axis=0)
 
-            output_name = args_cli.output_name
-            if not output_name.endswith(".npz"):
-                output_name = f"{output_name}.npz"
-            output_path = os.path.abspath(output_name)
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            np.savez(output_path, **log)
+            save_npz_exclusive(output_path, log, metadata)
             print(f"[INFO]: Motion saved locally: {output_path}")
+            return
 
 
-def main():
+def main() -> None:
     """Main function."""
     # Resolve robot platform from registry
     try:
@@ -305,10 +340,10 @@ def main():
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        simulation_app.close()
 
 '''
 python scripts/csv_to_npz.py --input_file /home/lsn/Datasets/bones-seed/g1/csv/210531/jump_and_land_heavy_001__A001_M.csv --input_fps 120 --bones_seed_g1_csv \

@@ -34,6 +34,42 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def _refresh_reset_relative_body_poses(
+    command: MotionCommand | MultiMotionCommand, env_ids: Sequence[int] | torch.Tensor,
+) -> None:
+    """Refresh only reset rows, without advancing time or sampling anything.
+
+    World-frame positions are (N, B, 3), quaternions use wxyz (N, B, 4).
+    Preserve the existing yaw alignment: robot anchor x/y, reference anchor z,
+    and yaw(robot_anchor * inverse(reference_anchor)). Root and joint writes
+    invalidate IsaacLab's body-link pose buffers; reading robot_anchor below
+    performs lazy forward kinematics before fetching the new torso pose. Do
+    not substitute the articulation root pose for the torso/anchor pose, and
+    do not call _update_command: it advances frames and updates sampling EMA.
+    Cache tensors retain their identities and non-reset rows remain untouched.
+    """
+    ids = torch.as_tensor(env_ids, device=command.device, dtype=torch.long)
+    assert ids.ndim == 1
+    if ids.numel() == 0:
+        return
+    assert bool(((ids >= 0) & (ids < command.num_envs)).all())
+    count, bodies = ids.numel(), len(command.cfg.body_names)
+    anchor_pos = command.anchor_pos_w[ids, None, :].repeat(1, bodies, 1)
+    anchor_quat = command.anchor_quat_w[ids, None, :].repeat(1, bodies, 1)
+    robot_anchor_pos = command.robot_anchor_pos_w[ids, None, :].repeat(1, bodies, 1)
+    robot_anchor_quat = command.robot_anchor_quat_w[ids, None, :].repeat(1, bodies, 1)
+    assert anchor_pos.shape == robot_anchor_pos.shape == (count, bodies, 3)
+    assert anchor_quat.shape == robot_anchor_quat.shape == (count, bodies, 4)
+    robot_anchor_pos[..., 2] = anchor_pos[..., 2]
+    yaw_delta = yaw_quat(quat_mul(robot_anchor_quat, quat_inv(anchor_quat)))
+    relative_pos = robot_anchor_pos + quat_apply(yaw_delta, command.body_pos_w[ids] - anchor_pos)
+    relative_quat = quat_mul(yaw_delta, command.body_quat_w[ids])
+    assert relative_pos.shape == (count, bodies, 3) and torch.isfinite(relative_pos).all()
+    assert relative_quat.shape == (count, bodies, 4) and torch.isfinite(relative_quat).all()
+    command.body_pos_relative_w[ids] = relative_pos
+    command.body_quat_relative_w[ids] = relative_quat
+
+
 # Keypoint debug markers: the policy observes keypoint *positions* (not rigid-body poses),
 # so a sphere is the honest visual primitive (a frame triad implies an orientation the
 # agent never sees). Green = robot's current keypoint, red = the command goal keypoint.
@@ -799,6 +835,7 @@ class MotionCommand(CommandTerm):
             torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
             env_ids=env_ids,
         )
+        _refresh_reset_relative_body_poses(self, env_ids)
 
     def _update_command(self):
         # ManagerBasedRLEnv clears episode_length_buf after an auto-reset and
@@ -2306,6 +2343,7 @@ class MultiMotionCommand(CommandTerm):
             torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1),
             env_ids=env_ids,
         )
+        _refresh_reset_relative_body_poses(self, env_ids)
 
     def _update_metrics(self):
         self.metrics["error_anchor_pos"].copy_(torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1))

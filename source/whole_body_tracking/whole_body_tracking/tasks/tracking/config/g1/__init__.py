@@ -104,6 +104,22 @@ def _register_g1_tasks() -> None:
         },
     )
 
+    # Separately selectable repair recipes; legacy task IDs remain available.
+    for task_id, env_config in (
+        ("General-Tracking-Flat-G1-Teacher-Cache-v1", flat_env_cfg.G1OneStageTrackingEnvCfg),
+        ("General-Tracking-Flat-G1-Teacher-Wrists-v1", flat_env_cfg.G1OneStageWristRewardV1EnvCfg),
+        ("General-Tracking-Flat-G1-Teacher-Points-v1", flat_env_cfg.G1OneStagePointRewardsV1EnvCfg),
+    ):
+        gym.register(
+            id=task_id,
+            entry_point="isaaclab.envs:ManagerBasedRLEnv",
+            disable_env_checker=True,
+            kwargs={
+                "env_cfg_entry_point": env_config,
+                "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
+            },
+        )
+
     ######### 2. Distillation-based tracking environments #########
 
     gym.register(

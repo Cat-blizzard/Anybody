@@ -3,6 +3,8 @@
 This script launches one Omniverse/Isaac session, sets up the same robot/scene,
 then iterates all matching CSV files in the input folder and writes NPZ files
 with a user-specified prefix added to the base filename.
+The output directory must be new. Default link_v2 preserves CSV link-origin
+kinematics and records native COM velocities. Use --self-test for CPU only.
 """
 
 from __future__ import annotations
@@ -52,13 +54,26 @@ def _sanitize_python_path_for_isaac() -> None:
 
 _sanitize_python_path_for_isaac()
 
+if '--self-test' in sys.argv:
+    if sys.argv[1:] != ['--self-test']:
+        raise SystemExit('--self-test is CPU-only and must be used alone')
+    from root_velocity_contract import self_test
+
+    self_test()
+    raise SystemExit(0)
+
 import argparse
 import os
 from pathlib import Path
+from typing import Any, Mapping
 import numpy as np
 
 from tqdm import tqdm
 
+from root_velocity_contract import (
+    MODES, conversion_metadata, plan_batch_outputs, reserve_output_directory,
+    save_npz_exclusive, validate_mode, write_csv_root_state,
+)
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -66,9 +81,11 @@ parser = argparse.ArgumentParser(description="Batch convert CSV motions in a fol
 parser.add_argument("--input_dir", type=str, required=True, help="Folder containing input CSV motion files.")
 parser.add_argument("--file_pattern", type=str, default="*.csv", help="Glob pattern to match input files.")
 parser.add_argument("--output_prefix", type=str, required=True, help='Prefix to add to output names, e.g. "g1_lafan".')
-parser.add_argument("--output_dir", type=str, default=None, help="Output folder (default: same as input_dir).")
+parser.add_argument("--output_dir", type=str, required=True, help="New output directory; an existing directory is always refused.")
 parser.add_argument("--input_fps", type=int, default=30, help="The fps of the input motions.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motions.")
+parser.add_argument('--root_velocity_mode', choices=MODES, default='link_v2',
+                    help='link_v2 transforms link velocity to native COM velocity; legacy_com_v1 preserves the old mismatch only in a new output directory.')
 parser.add_argument(
     "--frame_range",
     nargs=2,
@@ -131,6 +148,23 @@ if args_cli.bones_seed_g1_csv:
     args_cli.root_rotation = "euler_xyz_deg"
     args_cli.joint_angles_in_degrees = True
 
+# Freeze the entire output plan and refuse all collisions before native startup.
+if args_cli.input_fps <= 0 or args_cli.output_fps <= 0 or not np.isfinite(args_cli.position_scale) or args_cli.position_scale <= 0:
+    parser.error('FPS and position_scale must be positive and finite')
+if not np.isfinite(args_cli.min_duration) or args_cli.min_duration < 0:
+    parser.error('min_duration must be nonnegative and finite')
+if args_cli.frame_range is not None and not (1 <= args_cli.frame_range[0] <= args_cli.frame_range[1]):
+    parser.error('frame_range requires 1 <= START <= END')
+input_dir = Path(args_cli.input_dir).expanduser().resolve(strict=True)
+if not input_dir.is_dir():
+    parser.error('input_dir must be a directory')
+output_dir = Path(args_cli.output_dir).expanduser().absolute()
+csv_files = sorted(path for path in input_dir.rglob(args_cli.file_pattern) if path.is_file())
+if not csv_files:
+    parser.error('No CSV files matched; no output directory or native application was created')
+output_plan = plan_batch_outputs(input_dir, csv_files, output_dir, args_cli.output_prefix)
+output_run = reserve_output_directory(output_dir, validate_mode(args_cli.root_velocity_mode))
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -148,7 +182,7 @@ from motion_csv_loader import MotionLoader
 from whole_body_tracking.robots.robot_registry import available_robot_names, get_robot_platform
 
 
-def create_replay_scene_cfg(robot_cfg: ArticulationCfg):
+def create_replay_scene_cfg(robot_cfg: ArticulationCfg) -> type[InteractiveSceneCfg]:
     """Create a scene configuration for replaying motions with the specified robot."""
 
     @configclass
@@ -170,7 +204,7 @@ def create_replay_scene_cfg(robot_cfg: ArticulationCfg):
     return ReplayMotionsSceneCfg
 
 
-def setup_sim_and_scene(robot_cfg: ArticulationCfg):
+def setup_sim_and_scene(robot_cfg: ArticulationCfg) -> tuple[SimulationContext, InteractiveScene]:
     """Setup simulation and scene with one robot."""
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
     sim_cfg.dt = 1.0 / args_cli.output_fps
@@ -191,6 +225,7 @@ def process_one_file(
     output_npz_path: str,
     output_name: str,
     joint_names: list[str],
+    conversion_run: Mapping[str, Any],
 ) -> float | None:
     """Replay one CSV and save NPZ (and optionally log to wandb).
     
@@ -200,6 +235,11 @@ def process_one_file(
     # robot and joint indices
     robot = scene["robot"]
     robot_joint_indexes = robot.find_joints(joint_names, preserve_order=True)[0]
+    assert len(robot_joint_indexes) == len(joint_names)
+    options = {name:getattr(args_cli,name) for name in ('robot','input_fps','output_fps','frame_range',
+               'csv_skip_header','csv_drop_frame_column','root_rotation','joint_angles_in_degrees','position_scale')}
+    options['source_joint_names'] = joint_names
+    metadata = conversion_metadata(Path(csv_path), options, conversion_run, robot, Path(__file__))
 
     # motion loader
     motion = MotionLoader(
@@ -222,7 +262,7 @@ def process_one_file(
         return None
 
     # logger buffers
-    log = {
+    log: dict[str, Any] = {
         "fps": [args_cli.output_fps],
         "joint_pos": [],
         "joint_vel": [],
@@ -248,13 +288,15 @@ def process_one_file(
         root_states[:, 3:7] = motion_base_rot
         root_states[:, 7:10] = motion_base_lin_vel
         root_states[:, 10:] = motion_base_ang_vel
-        robot.write_root_state_to_sim(root_states)
+        write_csv_root_state(robot, root_states, validate_mode(str(conversion_run['root_velocity_mode'])))
 
         # joint state
         joint_pos = robot.data.default_joint_pos.clone()
         joint_vel = robot.data.default_joint_vel.clone()
         joint_pos[:, robot_joint_indexes] = motion_dof_pos
         joint_vel[:, robot_joint_indexes] = motion_dof_vel
+        assert joint_pos.shape == joint_vel.shape == robot.data.default_joint_pos.shape
+        assert bool(torch.isfinite(joint_pos).all()) and bool(torch.isfinite(joint_vel).all())
         robot.write_joint_state_to_sim(joint_pos, joint_vel)
 
         # no physics stepping; only render and update scene
@@ -266,13 +308,13 @@ def process_one_file(
         log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
         log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
         log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
-        log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
+        log["body_lin_vel_w"].append(robot.data.body_com_lin_vel_w[0, :].cpu().numpy().copy())
         log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
 
     # stack and save
     for k in ("joint_pos", "joint_vel", "body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w"):
         log[k] = np.stack(log[k], axis=0)
-    np.savez(output_npz_path, **log)
+    save_npz_exclusive(Path(output_npz_path), log, metadata)
     print(f"[INFO]: Saved NPZ: {output_npz_path}")
 
     if args_cli.log_wandb:
@@ -290,36 +332,23 @@ def process_one_file(
     return motion.duration
 
 
-def main():
+def main() -> None:
     # Resolve robot platform from registry
     try:
         robot_platform = get_robot_platform(args_cli.robot)
     except KeyError as e:
         raise SystemExit(f"{e}\nAvailable robots: {available_robot_names()}") from None
 
-    input_dir = Path(args_cli.input_dir).expanduser().resolve()
-    pattern = args_cli.file_pattern
-    output_dir = Path(args_cli.output_dir).expanduser().resolve() if args_cli.output_dir else input_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_files = sorted(input_dir.rglob(pattern))
-    if len(csv_files) == 0:
-        print(f"[WARN]: No files matched under {input_dir} with pattern '{pattern}'")
-        return
-
     sim, scene = setup_sim_and_scene(robot_platform.cfg)
     durations: list[float] = []
     skipped_count = 0
     try:
         all_files_length = len(csv_files)
-        for i, csv_path in enumerate(tqdm(csv_files, desc="Converting motions", unit="file")):
-            csv_path = Path(csv_path)
-            relative_csv = csv_path.relative_to(input_dir)
-            output_name = f"{args_cli.output_prefix}_{relative_csv.stem}"
-            output_npz_path = (output_dir / relative_csv).with_name(f"{output_name}.npz")
-            output_npz_path.parent.mkdir(parents=True, exist_ok=True)
+        for i, (csv_path, output_npz_path) in enumerate(tqdm(output_plan, desc="Converting motions", unit="file")):
+            output_name = output_npz_path.stem
             print(f"[INFO]: Converting {i+1}/{all_files_length}: {csv_path} -> {output_npz_path}")
-            duration = process_one_file(sim, scene, str(csv_path), str(output_npz_path), output_name, robot_platform.joint_names)
+            duration = process_one_file(sim, scene, str(csv_path), str(output_npz_path), output_name,
+                                        robot_platform.joint_names, output_run)
             if duration is not None:
                 durations.append(duration)
             else:

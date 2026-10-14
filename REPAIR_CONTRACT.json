@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "repair_date": "2026-10-15",
+  "base_commit": "c319a6609158fdb7456c065800b9a489b2605f5b",
+  "branch": "codex/teacher-correctness-fix-20261015",
+  "legacy_C": {
+    "source_worktree": "/data/jxc/projects/bones_curated/references/AnyBody_resume_state_fix_20261006",
+    "source_commit": "c319a6609158fdb7456c065800b9a489b2605f5b",
+    "condition": "C_semantic_recovery",
+    "motion_count": 14824,
+    "motion_view": "/data/jxc/projects/bones_curated/training/runs/stage0_gmt/curation_abc_fresh_7000_20261008T090539Z/data/motion_views/C_semantic_recovery_flat/train",
+    "training_seeds": [20260904, 20260905, 20260906],
+    "checkpoint_completed_updates": 7000,
+    "isolation_snapshot": "/data/jxc/projects/bones_curated/training/audit/anybody_teacher_correctness_fix_20261015/legacy_teacher_identity_capture_v1.json",
+    "isolation_snapshot_sha256": "c39bc916bd169a0feb8016f41b0c6de08a260ae13e3c6edc0368febae01fef2f",
+    "future_resume_requires_new_run_protocol_and_resource_preflight": true
+  },
+  "teacher_interface": {
+    "actor_observation_dimension": 815,
+    "critic_observation_dimension": 289,
+    "action_dimension": 29,
+    "tracked_bodies": 14,
+    "NPZ_body_axis": 30,
+    "network_architecture_unchanged": true,
+    "checkpoint_parameter_keys_unchanged": true
+  },
+  "profiles": {
+    "cache": {
+      "task": "General-Tracking-Flat-G1-Teacher-Cache-v1",
+      "changes": ["refresh_reset_relative_body_poses_v1", "remove_unused_zero_goal_debug"],
+      "reward_recipe": "legacy_unchanged"
+    },
+    "wrists": {
+      "task": "General-Tracking-Flat-G1-Teacher-Wrists-v1",
+      "inherits": "cache",
+      "reward_recipe": "g1_upper6_lower8_position_v1",
+      "upper": ["left_shoulder_roll_link", "left_elbow_link", "left_wrist_yaw_link", "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link"],
+      "lower": ["pelvis", "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link", "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link", "torso_link"],
+      "mean_denominator_change": "upper4_to6; prior shoulder/elbow squared-error contribution becomes2/3 when added wrist errors are zero",
+      "nominal_weights_and_sigmas_unchanged": true,
+      "VR_reward": "legacy_retained_for_ablation"
+    },
+    "points": {
+      "task": "General-Tracking-Flat-G1-Teacher-Points-v1",
+      "inherits": "wrists",
+      "head_point_definition": "g1_urdf_nominal_isolated_head_com_v1",
+      "head_offset_in_torso_m": [0.0092305, 0.000299, 0.405869],
+      "head_offset_source": "fixed_head_joint_translation_plus_isolated_head_inertial_origin_in_G1_URDF",
+      "reference_and_robot_use_same_world_point_formula": true,
+      "headset_or_author_point_equivalence": "NOT_ESTABLISHED",
+      "VR_points": ["virtual_nominal_head_centre", "left_wrist_yaw_link_origin", "right_wrist_yaw_link_origin"],
+      "VR_nominal_weight": 0.5,
+      "VR_sigma_m": 0.5
+    }
+  },
+  "conversion": {
+    "schema": "anybody_csv_npz_v2",
+    "default_mode": "link_v2",
+    "explicit_comparison_mode": "legacy_com_v1",
+    "link_velocity_formula": "v_COM = v_link + omega_world cross (R_link * r_COM)",
+    "NPZ_body_lin_vel_w_semantics": "rigid_body_COM_world",
+    "quaternion_order": "wxyz",
+    "length_unit": "m",
+    "output_directory_must_be_new": true,
+    "old_NPZ_regenerated": false,
+    "future_run_must_verify_actual_NPZ_conversion_metadata": true
+  },
+  "runtime_isolation": {
+    "source_packages_to_pin": ["whole_body_tracking", "rsl_rl"],
+    "new_source_roots": ["source/whole_body_tracking", "source/rsl_rl"],
+    "shared_editable_installations_modified": false,
+    "legacy_C_must_not_use_repair_source_or_reconverted_data": true
+  },
+  "validation_boundary": {
+    "CPU_selftests": "EXECUTED",
+    "legacy_checkpoint_compatibility": "EXECUTED",
+    "native_reset_and_first_step": "NOT_RUN",
+    "native_conversion": "NOT_RUN",
+    "new_native_training": "NOT_RUN",
+    "learning_or_tracking_improvement": "NOT_TESTED",
+    "student_normalization_and_freezing_repairs": "OUT_OF_SCOPE"
+  }
+}

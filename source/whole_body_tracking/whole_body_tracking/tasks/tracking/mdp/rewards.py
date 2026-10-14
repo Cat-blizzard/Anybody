@@ -8,6 +8,7 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_error_magnitude
 
 from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
+from . import teacher_point_contract as teacher_points
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -233,6 +234,51 @@ def teleop_vr_3point(
         return torch.exp(-error / (std ** 2))
     else:
         return torch.zeros(env.num_envs, device=env.device)
+
+
+def teleop_body_position_extend_g1_v1(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    upper_body_std: float = 0.5,
+    lower_body_std: float = 0.5,
+    upper_weight: float = 1.0,
+    lower_weight: float = 1.0,
+) -> torch.Tensor:
+    """Declared upper6/lower8 world-position reward; rejects missing G1 points.
+
+    The original teleop_body_position_extend remains available. This version
+    changes the upper-group averaging denominator and is a new reward recipe.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return teacher_points.extension_position_reward(
+        command.body_pos_w, command.robot_body_pos_w, command.cfg.body_names,
+        upper_body_std, lower_body_std, upper_weight, lower_weight,
+    )
+
+
+def teleop_vr_3point_g1_v1(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    head_offset_in_torso: tuple[float, float, float],
+    head_point_definition: str,
+) -> torch.Tensor:
+    """Nominal URDF head centre + wrist origins, same definition on both sides.
+
+    The named surrogate is recorded in reward params; no head body, NPZ axis
+    or observation dimension is added. It is not certified as the author or
+    headset point. Raw reward keeps the existing coordinate-MSE exponential.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    reference = teacher_points.g1_three_points(
+        command.body_pos_w, command.body_quat_w, command.cfg.body_names,
+        head_offset_in_torso, head_point_definition,
+    )
+    actual = teacher_points.g1_three_points(
+        command.robot_body_pos_w, command.robot_body_quat_w, command.cfg.body_names,
+        head_offset_in_torso, head_point_definition,
+    )
+    return teacher_points.point_position_reward(reference, actual, std)
 
 
 def teleop_body_position_feet(

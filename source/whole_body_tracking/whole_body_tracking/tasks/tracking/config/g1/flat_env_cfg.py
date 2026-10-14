@@ -16,6 +16,7 @@ from rsl_rl.modules.latent_bottleneck_muse_kp import (
 from whole_body_tracking.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
 from whole_body_tracking.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
 import whole_body_tracking.tasks.tracking.mdp as mdp
+from whole_body_tracking.tasks.tracking.mdp import teacher_point_contract as teacher_points
 from whole_body_tracking.tasks.tracking.config.g1 import mask_modes
 from whole_body_tracking.tasks.tracking.tracking_env_cfg import (
     TrackingEnvCfg,
@@ -231,6 +232,38 @@ class G1OneStageTrackingEnvCfg(OneStageTrackingEnvCfg):
             "right_elbow_link",
             "right_wrist_yaw_link",
         ]
+
+
+@configclass
+class G1OneStageWristRewardV1EnvCfg(G1OneStageTrackingEnvCfg):
+    """Teacher initialization fixes plus explicit upper6/lower8 wrist coverage.
+
+    All observations, nominal reward weights/stds, PPO and tracked body axes
+    are inherited. Only the extension position term selects the new profile.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        teacher_points.validate_g1_partition(self.commands.motion.body_names)
+        self.rewards.teleop_body_position_extend.func = mdp.teleop_body_position_extend_g1_v1
+
+
+@configclass
+class G1OneStagePointRewardsV1EnvCfg(G1OneStageWristRewardV1EnvCfg):
+    """Wrist profile plus declared virtual head/wrists three-point reward.
+
+    The head is a nominal asset-defined surrogate, not an exact reconstruction
+    of the authors' undisclosed VR target. Definition and offset are serialized.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.rewards.teleop_vr_3point.func = mdp.teleop_vr_3point_g1_v1
+        self.rewards.teleop_vr_3point.params = {
+            **self.rewards.teleop_vr_3point.params,
+            "head_offset_in_torso": teacher_points.g1_head_offset_from_urdf(),
+            "head_point_definition": teacher_points.G1_HEAD_POINT_V1,
+        }
 
 
 @configclass
