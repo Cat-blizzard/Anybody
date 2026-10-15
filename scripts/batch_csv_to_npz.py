@@ -382,7 +382,12 @@ def main() -> None:
         print("=" * 80)
         
         # close sim app (this may exit the program, so do it last)
-        simulation_app.close()
+        # Unsubscribe IsaacLab's STOP rendering callback before stage close.
+        # This runs after conversion; it does not step or modify motion data.
+        try:
+            SimulationContext.clear_instance()
+        finally:
+            simulation_app.close()
 
 
 if __name__ == "__main__":

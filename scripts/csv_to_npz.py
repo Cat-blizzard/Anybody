@@ -343,7 +343,12 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        simulation_app.close()
+        # Unsubscribe IsaacLab's STOP rendering callback before stage close.
+        # This runs after conversion; it does not step or modify motion data.
+        try:
+            SimulationContext.clear_instance()
+        finally:
+            simulation_app.close()
 
 '''
 python scripts/csv_to_npz.py --input_file /home/lsn/Datasets/bones-seed/g1/csv/210531/jump_and_land_heavy_001__A001_M.csv --input_fps 120 --bones_seed_g1_csv \
