@@ -14,6 +14,7 @@ from rsl_rl.modules import ActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
+from rsl_rl.utils.distributed_contract import collective_require_finite
 
 
 class PPO:
@@ -47,9 +48,12 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Critic warmup parameters
         critic_warmup_itrs=0,
+        # Opt-in engineering guard; old finite single-rank behavior is unchanged.
+        strict_finite_checks: bool = False,
     ):
         # device-related parameters
         self.device = device
+        self.strict_finite_checks = strict_finite_checks
         self.is_multi_gpu = multi_gpu_cfg is not None
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
@@ -93,6 +97,8 @@ class PPO:
 
         # PPO components
         self.policy = policy
+        if self.strict_finite_checks:
+            self.policy.strict_finite_checks = True
         self.policy.to(self.device)
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
@@ -264,6 +270,12 @@ class PPO:
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
+            self._strict_check(
+                (obs_batch, critic_obs_batch, actions_batch, target_values_batch,
+                 advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch),
+                "PPO mini-batch inputs",
+            )
+
             # Critic-only warmup: skip all actor-related computations (policy act, KL,
             # surrogate, entropy) and only train the value function for the first
             # `critic_warmup_itrs` iterations to stabilize the critic before
@@ -286,13 +298,17 @@ class PPO:
                     value_loss = (returns_batch - value_batch).pow(2).mean()
 
                 loss = self.value_loss_coef * value_loss
+                self._strict_check(loss, "PPO critic warmup loss")
 
                 # Critic-only gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
+                self._strict_check_gradients("PPO critic warmup local gradients")
                 if self.is_multi_gpu:
                     self.reduce_parameters()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self._strict_check_gradients("PPO critic warmup averaged gradients")
+                grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self._strict_check(grad_norm, "PPO critic warmup gradient norm")
                 self.optimizer.step()
 
                 mean_value_loss += value_loss.item()
@@ -314,6 +330,7 @@ class PPO:
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             # KL
+            next_learning_rate = None
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
@@ -324,28 +341,29 @@ class PPO:
                         axis=-1,
                     )
                     kl_mean = torch.mean(kl)
+                    self._strict_check(kl_mean, "PPO adaptive KL")
 
                     # Reduce the KL divergence across all GPUs
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
+                    self._strict_check(kl_mean, "PPO averaged adaptive KL")
 
-                    # Update the learning rate
+                    # Calculate the next rate, committing it only after the
+                    # finite loss/gradient gates. Failed batches must not even
+                    # mutate Adam's parameter-group learning rate.
+                    next_learning_rate = self.learning_rate
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            next_learning_rate = max(1e-5, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                            next_learning_rate = min(1e-2, self.learning_rate * 1.5)
 
                     # Update the learning rate for all GPUs
                     if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                        lr_tensor = torch.tensor(next_learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
-
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                        next_learning_rate = lr_tensor.item()
 
             # Surrogate loss (actor)
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -409,6 +427,10 @@ class PPO:
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
+            self._strict_check(loss, "PPO loss")
+            if self.rnd:
+                self._strict_check(rnd_loss, "PPO RND loss")
+
             # Compute the gradients
             # -- For PPO
             self.optimizer.zero_grad()
@@ -418,13 +440,21 @@ class PPO:
                 self.rnd_optimizer.zero_grad()  # type: ignore
                 rnd_loss.backward()
 
+            self._strict_check_gradients("PPO local gradients")
+
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
                 self.reduce_parameters()
+            self._strict_check_gradients("PPO averaged gradients")
 
             # Apply the gradients
             # -- For PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self._strict_check(grad_norm, "PPO gradient norm")
+            if next_learning_rate is not None:
+                self.learning_rate = next_learning_rate
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
             self.optimizer.step()
             # -- For RND
             if self.rnd_optimizer:
@@ -471,18 +501,35 @@ class PPO:
     Helper functions
     """
 
-    def broadcast_parameters(self):
-        """Broadcast model parameters to all GPUs."""
-        # obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
+    def _strict_check(self, tensors: torch.Tensor | tuple[torch.Tensor, ...], label: str) -> None:
+        """Collectively reject invalid values only for the opt-in strict profile."""
+        if self.strict_finite_checks:
+            collective_require_finite(tensors, label)
+
+    def _strict_check_gradients(self, label: str) -> None:
+        """Check existing gradients on the live parameter device before Adam."""
+        if self.strict_finite_checks:
+            parameters = self.policy.parameters()
+            if self.rnd:
+                parameters = chain(parameters, self.rnd.parameters())
+            gradients = tuple(parameter.grad for parameter in parameters if parameter.grad is not None)
+            collective_require_finite(gradients, label)
+
+    @torch.no_grad()
+    def broadcast_parameters(self) -> None:
+        """Broadcast live policy tensors from rank 0, keeping each rank's device.
+
+        Tensor collectives avoid serializing CUDA device tags into an object
+        payload. ``state_dict`` values share storage with parameters/buffers;
+        broadcasting them updates the live module and preserves Adam references.
+        The RND predictor scope matches the original implementation.
+        """
+        modules = [self.policy]
         if self.rnd:
-            model_params.append(self.rnd.predictor.state_dict())
-        # broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # load the model parameters on all GPUs from source GPU
-        self.policy.load_state_dict(model_params[0])
-        if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            modules.append(self.rnd.predictor)
+        for module in modules:
+            for value in module.state_dict().values():
+                torch.distributed.broadcast(value, src=0)
 
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
@@ -513,3 +560,24 @@ class PPO:
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # update the offset for the next parameter
                 offset += numel
+
+
+if __name__ == "__main__":
+    torch.set_num_threads(1)
+    torch.manual_seed(7)
+    policy = ActorCritic(4, 5, 2, actor_hidden_dims=[8], critic_hidden_dims=[8])
+    algorithm = PPO(policy, num_learning_epochs=5, num_mini_batches=4,
+                    strict_finite_checks=True, device="cpu")
+    algorithm.init_storage("rl", 4, 4, [4], [5], [2])
+    for step in range(4):
+        with torch.no_grad():
+            actions = algorithm.act(torch.zeros(4, 4), torch.zeros(4, 5))
+            assert actions.shape == (4, 2) and torch.isfinite(actions).all()
+            algorithm.process_env_step(torch.ones(4), torch.zeros(4), {})
+    with torch.no_grad():
+        algorithm.compute_returns(torch.zeros(4, 5))
+    losses = algorithm.update()
+    assert all(torch.isfinite(torch.tensor(value)) for value in losses.values())
+    assert all(int(state["step"].item()) == 20 for state in algorithm.optimizer.state.values())
+    assert not torch.cuda.is_initialized()
+    print(f"PPO strict CPU: rollout=(4,4), actions=(4,2), 20 Adam steps, finite losses={losses} PASS")

@@ -267,6 +267,26 @@ class G1OneStagePointRewardsV1EnvCfg(G1OneStageWristRewardV1EnvCfg):
 
 
 @configclass
+class G1OneStageFullBPointRewardsV1EnvCfg(G1OneStagePointRewardsV1EnvCfg):
+    """Full-B teacher: existing sharding selectors, explicit complete catalog cap.
+
+    With86128 inputs and8 ranks, native chunk sharding selects10766 per rank;
+    with one rank, all86128 remain eligible. Sampling logic is unchanged.
+    CPU preload keeps dataset storage outside the4096-env simulator GPU budget.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.commands.motion.motion_dataset_load_cap = 86128
+        self.commands.motion.motion_dataset_shard_across_gpus = True
+        self.commands.motion.motion_dataset_shard_by = "global"
+        self.commands.motion.motion_dataset_shard_strategy = "chunk"
+        self.commands.motion.motion_dataset_shard_seed = 0
+        self.commands.motion.motion_dataset_log_shard_info = True
+        self.commands.motion.motion_preload_device = "cpu"
+
+
+@configclass
 class G1VAEDistillationTrackingEnvCfg(VAEDistillationTrackingEnvCfg):
     """G1-specific VAE distillation env config."""
 
