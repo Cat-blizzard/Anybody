@@ -1,5 +1,11 @@
 # AnyBody: Whole-Body Humanoid Tracking from Arbitrary Keypoint Subsets
 
+> **Local reproduction fork.** This repository includes teacher correctness repairs
+> and explicitly versioned reward/data variants. The frozen source used for the
+> current New B experiments is `306c5d0a4262ff3df435c00247c3cb0a73c34f7e`.
+> See [Reproduction status](REPRODUCTION_STATUS.md) for source identities,
+> validation limits, and differences from the authors' release.
+
 [![IsaacSim](https://img.shields.io/badge/IsaacSim-4.5.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
 [![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.1.0-silver)](https://isaac-sim.github.io/IsaacLab)
 [![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://docs.python.org/3/whatsnew/3.10.html)
