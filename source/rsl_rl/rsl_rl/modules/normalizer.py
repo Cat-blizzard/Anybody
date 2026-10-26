@@ -57,7 +57,11 @@ class EmpiricalNormalization(nn.Module):
     def update(self, x):
         """Learn input values without computing the output values of them"""
 
-        if self.until is not None and self.count >= self.until:
+        distributed_sync = getattr(self, "_distributed_normalizer_sync", None)
+        if distributed_sync is not None:
+            if not distributed_sync.before_update(x):
+                return
+        elif self.until is not None and self.count >= self.until:
             return
 
         count_x = x.shape[0]
@@ -144,3 +148,22 @@ class DiscountedAverage:
         else:
             self.avg = self.avg * self.gamma + rew
         return self.avg
+
+
+def _sanity_check() -> None:
+    """Check finite singleton/boundary batches without a process group."""
+    norm = EmpiricalNormalization((2,), until=2)
+    initial = torch.tensor([[1.0, -1.0]])
+    result = norm(initial)
+    assert result.shape == (1, 2) and torch.isfinite(result).all()
+    norm(torch.tensor([[3.0, 2.0], [5.0, 3.0]]))
+    assert int(norm.count) == 3  # retain the upstream whole-batch overshoot
+    snapshot = {name: value.clone() for name, value in norm.state_dict().items()}
+    norm(torch.zeros((1, 2)))
+    assert all(torch.equal(value, norm.state_dict()[name]) for name, value in snapshot.items())
+    assert torch.allclose(norm.inverse(norm(initial)), initial)
+    print("normalizer sanity passed: singleton shape", tuple(result.shape), "until-overshoot count", int(norm.count))
+
+
+if __name__ == "__main__":
+    _sanity_check()

@@ -54,6 +54,7 @@ from rsl_rl.utils import (
     try_build_rl_split_normalizers_from_checkpoint,
 )
 from rsl_rl.utils.finite_checks import replace_nonfinite_with_zeros
+from rsl_rl.utils.distributed_normalizer import DistributedNormalizerSync, normalize_without_update
 from rsl_rl.utils.checkpoint_resume import (
     checkpoint_progress,
     ppo_optimizer_learning_rate,
@@ -92,6 +93,8 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self._distributed_normalizer_helpers: dict[str, DistributedNormalizerSync] = {}
+        self._distributed_normalizer_checkpoint: dict | None = None
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -862,6 +865,65 @@ class OnPolicyRunner:
             )
         '''
 
+    def _configure_teacher_normalizer_sync(self) -> None:
+        """Opt in only online full-observation actor/critic norms for teacher PPO.
+
+        Frozen teachers and all split-normalizer paths are excluded from this
+        teacher-specific implementation. Online split goals would need a
+        separate explicit integration if that training stage is later enabled.
+        """
+        if not self.cfg.get("distributed_normalizer_sync", False) or not self.is_distributed:
+            return
+        assert self.training_type == "rl", "Distributed normalization profile is teacher PPO only"
+        assert not self._use_anybody_latent_split_normalizers(), "Teacher profile cannot modify split normalizers"
+        assert self.empirical_normalization
+        scope = self.cfg.get("normalizer_until_count_scope", "per_rank_equivalent")
+        assert scope == "per_rank_equivalent"
+        if self._distributed_normalizer_helpers:
+            return
+        saved = self._distributed_normalizer_checkpoint
+        if saved is not None:
+            assert saved["world_size"] == self.gpu_world_size, "Changing world size requires an explicit migration"
+            assert saved["until_count_scope"] == scope
+        selected = {}
+        for name, module in (("actor", self.obs_normalizer), ("critic", self.privileged_obs_normalizer)):
+            if not isinstance(module, EmpiricalNormalization) or not module.training:
+                continue
+            if self.cfg.get("freeze_normalizer_on_resume", False):
+                continue
+            state = None if saved is None else saved["normalizers"].get(name)
+            if state is None and module.until is not None and module.count >= module.until:
+                continue
+            selected[name] = (module, state)
+        names = sorted(selected)
+        all_names = [None] * self.gpu_world_size
+        torch.distributed.all_gather_object(all_names, names)
+        assert all(entry == names for entry in all_names), "Ranks selected different online normalizers"
+        for name in names:
+            module, state = selected[name]
+            self._distributed_normalizer_helpers[name] = DistributedNormalizerSync(
+                module, until_count_scope=scope, state=state
+            )
+
+    def _sync_teacher_normalizers(
+        self, raw_obs: torch.Tensor, raw_privileged_obs: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Synchronize once per rollout and refresh cached inputs without updates."""
+        assert self._distributed_normalizer_helpers
+        for name in sorted(self._distributed_normalizer_helpers):
+            info = self._distributed_normalizer_helpers[name].synchronize()
+            if not getattr(self, "_distributed_normalizer_logged", False):
+                print(f"[DistributedNormalizer] rank={self.gpu_global_rank} name={name} state={info}")
+        self._distributed_normalizer_logged = True
+        obs = replace_nonfinite_with_zeros(normalize_without_update(self.obs_normalizer, raw_obs))
+        if raw_privileged_obs is None:
+            privileged_obs = obs
+        else:
+            privileged_obs = replace_nonfinite_with_zeros(
+                normalize_without_update(self.privileged_obs_normalizer, raw_privileged_obs)
+            )
+        return obs, privileged_obs
+
     def learn(
         self,
         num_learning_iterations: int,
@@ -954,6 +1016,16 @@ class OnPolicyRunner:
         setattr(env_u_curr, "curriculum_learning_iteration_anchor", int(start_iter))
 
         # start learning
+        # Only the opt-in DDP teacher path changes setup order. Legacy and
+        # single-rank behavior retain the original forward/update implementation.
+        if self.cfg.get("distributed_normalizer_sync", False) and (
+            self.is_distributed or self._distributed_normalizer_checkpoint is not None
+        ):
+            if eval_mode:
+                self.eval_mode()
+            elif self.is_distributed:
+                self.train_mode()
+                self._configure_teacher_normalizer_sync()
         obs, extras = self.env.get_observations()
         #print(obs[0])
         obs_dict = extras.get("observations", {})
@@ -974,6 +1046,8 @@ class OnPolicyRunner:
             ref_vel_estimator_obs = ref_vel_estimator_obs.to(self.device)
 
         # Normalize initial observations (same as in training loop)
+        raw_obs_for_sync = obs
+        raw_privileged_obs_for_sync = privileged_obs
         obs = self._normalize_student_obs(obs)
         privileged_obs = replace_nonfinite_with_zeros(self.privileged_obs_normalizer(privileged_obs))
         teacher_obs = self.teacher_obs_normalizer(teacher_obs)
@@ -1006,6 +1080,9 @@ class OnPolicyRunner:
             self.alg.broadcast_parameters()
             # TODO: Do we need to synchronize empirical normalizers?
             #   Right now: No, because they all should converge to the same values "asymptotically".
+
+        if not eval_mode and self._distributed_normalizer_helpers:
+            obs, privileged_obs = self._sync_teacher_normalizers(raw_obs_for_sync, raw_privileged_obs_for_sync)
 
         # Match mask row to motion EE metrics before the first rollout so early episode completions
         # do not log bucket errors with uninitialized mode indices (-1) or poison means with NaNs.
@@ -1126,14 +1203,17 @@ class OnPolicyRunner:
                         teacher_obs_raw = obs_dict[self.teacher_obs_type].to(self.device)
                         self._assert_anybody_latent_proprio_alignment(obs, teacher_obs_raw) # TODO: remove this
                     # perform normalization
+                    raw_obs_for_sync = obs
                     obs = self._normalize_student_obs(obs)
                     if self.privileged_obs_type is not None and self.privileged_obs_type in obs_dict:
+                        raw_privileged_obs_for_sync = obs_dict[self.privileged_obs_type].to(self.device)
                         privileged_obs = replace_nonfinite_with_zeros(
                             self.privileged_obs_normalizer(
                                 obs_dict[self.privileged_obs_type].to(self.device)
                             )
                         )
                     else:
+                        raw_privileged_obs_for_sync = None
                         privileged_obs = obs
                     if teacher_obs_raw is not None:
                         teacher_obs = self.teacher_obs_normalizer(teacher_obs_raw)
@@ -1183,6 +1263,14 @@ class OnPolicyRunner:
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
+
+                # Every rank merges only this rollout's new moments. Refresh
+                # already cached next observations without counting them twice.
+                # This occurs once before GAE/PPO update, never in minibatches.
+                if not eval_mode and self._distributed_normalizer_helpers:
+                    obs, privileged_obs = self._sync_teacher_normalizers(
+                        raw_obs_for_sync, raw_privileged_obs_for_sync
+                    )
 
                 # compute returns (training-only)
                 # NOTE: "latent_rl" MUST be here. It is a PPO-style on-policy type
@@ -1468,6 +1556,16 @@ class OnPolicyRunner:
             training_type=self.training_type,
             teacher_obs_normalizer=self.teacher_obs_normalizer,
         )
+        if self._distributed_normalizer_helpers:
+            saved_dict["distributed_normalizer_state_dict"] = {
+                "version": 1,
+                "world_size": self.gpu_world_size,
+                "until_count_scope": "per_rank_equivalent",
+                "normalizers": {
+                    name: helper.state_dict(require_synchronized=True)
+                    for name, helper in self._distributed_normalizer_helpers.items()
+                },
+            }
 
         # save model
         torch.save(saved_dict, path)
@@ -1487,6 +1585,11 @@ class OnPolicyRunner:
         configured optimizer/LR. This does not restore simulator or RNG state.
         """
         loaded_dict = torch.load(path, map_location=self.device, weights_only=False)
+        assert not self._distributed_normalizer_helpers, "Resume must precede the first learning rollout"
+        self._distributed_normalizer_checkpoint = loaded_dict.get("distributed_normalizer_state_dict")
+        if self._distributed_normalizer_checkpoint is not None and load_optimizer:
+            assert self.cfg.get("distributed_normalizer_sync", False), "DDP normalization resume requires its opt-in profile"
+            assert self.is_distributed, "Cross-world-size normalization resume requires an explicit migration"
 
         # Check if using ResidualActorCritic (special handling)
         from rsl_rl.modules import ResidualActorCritic

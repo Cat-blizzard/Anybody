@@ -12,6 +12,7 @@ from torch.distributions import Normal
 
 from rsl_rl.utils import resolve_nn_activation
 from rsl_rl.utils.finite_checks import require_all_finite
+from rsl_rl.utils.distributed_contract import collective_require_finite
 
 
 class ActorWithSkip(nn.Module):
@@ -58,6 +59,7 @@ class ActorCritic(nn.Module):
         noise_std_type: str = "scalar",
         ref_vel_skip_first_layer: bool = False,
         ref_vel_dim: int = 3,
+        strict_finite_checks: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -66,6 +68,7 @@ class ActorCritic(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
+        self.strict_finite_checks = strict_finite_checks
         activation = resolve_nn_activation(activation)
 
         # Store ref_vel skip connection parameters
@@ -258,22 +261,31 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations):
-        require_all_finite(observations, "ActorCritic update_distribution observations")
+        if self.strict_finite_checks:
+            collective_require_finite(observations, "ActorCritic update_distribution observations")
+        else:
+            require_all_finite(observations, "ActorCritic update_distribution observations")
 
         # compute mean (actor.forward handles both standard and skip connection modes)
         mean = self.actor(observations)
         # No unused goal-compaction debug path: an entirely zero finite goal
         # is a valid input and must not fail via reshape(-1, 0).
-        mean = self._ensure_finite(mean, "action mean")
+        if not self.strict_finite_checks:
+            mean = self._ensure_finite(mean, "action mean")
         # compute standard deviation
         if self.noise_std_type == "scalar":
+            raw_std = self.std
             # Keep std strictly positive to avoid invalid Normal distributions.
             std = torch.clamp_min(self.std, 1e-6).expand_as(mean)
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
+            raw_std = self.log_std
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        std = self._ensure_finite(std, "action std")
+        if self.strict_finite_checks:
+            collective_require_finite((mean, raw_std, std), "ActorCritic raw action mean/std")
+        else:
+            std = self._ensure_finite(std, "action std")
         # create distribution
         self.distribution = Normal(mean, std)
 
@@ -285,13 +297,20 @@ class ActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
-        require_all_finite(observations, "ActorCritic act_inference observations")
+        if self.strict_finite_checks:
+            collective_require_finite(observations, "ActorCritic act_inference observations")
+        else:
+            require_all_finite(observations, "ActorCritic act_inference observations")
         # actor.forward handles both standard and skip connection modes
         actions_mean = self.actor(observations)
+        if self.strict_finite_checks:
+            collective_require_finite(actions_mean, "ActorCritic inference action mean")
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
         value = self.critic(critic_observations)
+        if self.strict_finite_checks:
+            collective_require_finite((critic_observations, value), "ActorCritic critic input/value")
         return value
 
     def load_state_dict(self, state_dict, strict=True):
@@ -309,3 +328,21 @@ class ActorCritic(nn.Module):
 
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+
+if __name__ == "__main__":
+    torch.set_num_threads(1)
+    for batch_size in (1, 3):
+        actor = ActorCritic(4, 5, 2, actor_hidden_dims=[8], critic_hidden_dims=[8], strict_finite_checks=True)
+        actions = actor.act(torch.zeros(batch_size, 4))
+        assert actions.shape == (batch_size, 2) and torch.isfinite(actions).all()
+        values = actor.evaluate(torch.zeros(batch_size, 5))
+        assert values.shape == (batch_size, 1) and torch.isfinite(values).all()
+        try:
+            actor.act(torch.full((batch_size, 4), float("nan")))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Strict actor accepted non-finite observations")
+        print(f"ActorCritic strict CPU: obs=({batch_size},4), actions={tuple(actions.shape)}, values={tuple(values.shape)} PASS")
+    assert not torch.cuda.is_initialized()

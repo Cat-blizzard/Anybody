@@ -61,6 +61,24 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
 
 
+@configclass
+class G1FullBPPORunnerCfg(G1FlatPPORunnerCfg):
+    """Full-B teacher, unchanged PPO knobs plus explicit DDP correctness gates.
+
+    Normalizer synchronization is a local implementation, not an author preset.
+    The stopping threshold keeps the original per-rank sample-count semantics.
+    """
+
+    max_iterations = 100000
+    save_interval = 1000
+    experiment_name = "g1_full_B_ddp8_points_v1"
+    distributed_normalizer_sync: bool = True
+    normalizer_until_count_scope: str = "per_rank_equivalent"
+
+    def __post_init__(self) -> None:
+        self.algorithm.strict_finite_checks = True
+
+
 LOW_FREQ_SCALE = 0.5
 
 

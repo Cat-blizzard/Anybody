@@ -1,10 +1,12 @@
 # AnyBody: Whole-Body Humanoid Tracking from Arbitrary Keypoint Subsets
 
-> **Local reproduction fork.** This repository includes teacher correctness repairs
-> and explicitly versioned reward/data variants. The frozen source used for the
-> current New B experiments is `306c5d0a4262ff3df435c00247c3cb0a73c34f7e`.
-> See [Reproduction status](REPRODUCTION_STATUS.md) for source identities,
-> validation limits, and differences from the authors' release.
+> **Local reproduction fork.** This repository includes repairs to the authors'
+> teacher-training workflow and explicitly versioned reward/data variants.
+> The 2026-10-26 update adds teacher multi-GPU correctness repairs from
+> `c23e488af67f7cc9aa57be4c457d4602cd06553d`. Custom latent-space research and
+> terrain-training extensions are outside this publication.
+> See [Reproduction status](REPRODUCTION_STATUS.md) for source identities and
+> [distributed teacher notes](docs/full_b_ddp_teacher.md) for the optional profile.
 
 [![IsaacSim](https://img.shields.io/badge/IsaacSim-4.5.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
 [![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.1.0-silver)](https://isaac-sim.github.io/IsaacLab)
@@ -53,7 +55,7 @@ git fetch --all && git checkout v2.1.0
 Clone this repository **outside** the `IsaacLab` directory:
 
 ```bash
-git clone https://github.com/hazel-hammer/Anybody.git
+git clone https://github.com/Cat-blizzard/Anybody.git
 cd Anybody
 ```
 

@@ -109,6 +109,7 @@ def _register_g1_tasks() -> None:
         ("General-Tracking-Flat-G1-Teacher-Cache-v1", flat_env_cfg.G1OneStageTrackingEnvCfg),
         ("General-Tracking-Flat-G1-Teacher-Wrists-v1", flat_env_cfg.G1OneStageWristRewardV1EnvCfg),
         ("General-Tracking-Flat-G1-Teacher-Points-v1", flat_env_cfg.G1OneStagePointRewardsV1EnvCfg),
+        ("General-Tracking-Flat-G1-Teacher-FullB-Points-v1", flat_env_cfg.G1OneStageFullBPointRewardsV1EnvCfg),
     ):
         gym.register(
             id=task_id,
@@ -116,7 +117,8 @@ def _register_g1_tasks() -> None:
             disable_env_checker=True,
             kwargs={
                 "env_cfg_entry_point": env_config,
-                "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg",
+                "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:"
+                + ("G1FullBPPORunnerCfg" if "Teacher-FullB-" in task_id else "G1FlatPPORunnerCfg"),
             },
         )
 

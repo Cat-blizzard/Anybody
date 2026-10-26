@@ -11,10 +11,33 @@ license files are retained. This document does not relicense upstream components
 | Authors' public release | `0cffa139eab0bc145c9216223e249f03c67a324c` | Common ancestor of the local repairs |
 | Legacy A/B/C teacher source | `c319a6609158fdb7456c065800b9a489b2605f5b` | `reproduction/legacy-c319a66` |
 | Frozen New B teacher source | `306c5d0a4262ff3df435c00247c3cb0a73c34f7e` | `reproduction/new-b-306c5d0` |
+| Teacher distributed-correctness source | `c23e488af67f7cc9aa57be4c457d4602cd06553d` | Ancestor of the 2026-10-26 publication on `main` |
 
-The publication commit on `main` adds documentation only relative to the frozen
-New B source. The active training checkout and its frozen source identity are
-kept separate from this publication checkout.
+The original publication added documentation to the frozen New B source.
+The 2026-10-26 update also includes the teacher distributed-correctness changes
+listed below. Runtime files match the identified distributed-correctness source;
+publication documentation is maintained separately. Active training checkouts
+and their frozen source identities remain separate from this publication.
+
+## Publication scope: 2026-10-26
+
+The authors' current public `main` was checked against release commit
+`0cffa139eab0bc145c9216223e249f03c67a324c`. This update covers the original
+teacher-training workflow and its engineering support:
+
+- Broadcast actual policy parameters and buffers consistently across ranks.
+- Optionally synchronize online teacher observation statistics, preserving
+  single-process behavior and frozen or split-normalizer paths.
+- Optionally reject nonfinite inputs, losses, and gradients collectively before
+  an optimizer update.
+- Provide a separate full-catalog teacher task/profile and CPU regressions.
+
+The authors' original encoder/decoder, latent-RL modules, and downstream tasks
+remain available as upstream code. This update does not add our custom latent
+analysis, predictive/innovation research, terrain training, Plan v2.4 modules,
+experiment controllers, model weights, logs, or raw experimental results.
+The full-catalog profile is a local reproduction configuration, not an official
+default or a new control-performance claim.
 
 ## Changes relative to the authors' release
 
@@ -40,11 +63,13 @@ kept separate from this publication checkout.
 - Add CPU regressions, a bounded native reset checker, and legacy-source isolation
   checks.
 
-The original reward functions and task IDs remain available. The PPO algorithm,
-GAE/loss formulas, original PPO configuration, six-hidden-layer teacher network,
-and 815/289/29 actor/critic/action interfaces are not changed by these repairs.
-The separate uncommitted CPU broadcast patch in the original reference checkout
-is not part of this frozen source.
+The original reward functions and task IDs remain available. The GAE/loss
+formulas, original PPO configuration, six-hidden-layer teacher network, and
+815/289/29 actor/critic/action interfaces are retained. The distributed update
+changes synchronization and optional failure checks without adding a new
+policy-learning objective. The historical uncommitted CPU-object broadcast
+patch is not imported; this update includes the separately tested
+tensor-broadcast implementation from the identified source.
 
 ## Experimental scope
 
@@ -69,6 +94,14 @@ Training data, checkpoints, raw trajectories, experiment controllers, and local
 audit results are not included in this source publication.
 
 ## Validation and portability
+
+For the 2026-10-26 publication, eight CPU entrypoints passed: finite-value
+checks, normalization self-tests, two-rank PPO, distributed normalization,
+full-catalog sharding, config serialization, synthetic checkpoint restoration,
+and the zero-goal actor regression. All 185 tracked Python files parsed
+successfully. Runtime files were checked byte-for-byte against `c23e488`;
+the 14 upstream latent/residual modules remain byte-identical to `0cffa13`.
+This publication check did not launch a simulator or execute GPU training.
 
 CPU regressions, native reset checks, conversion checks, and a short training /
 checkpoint-restore chain were previously run in the local environment. These
